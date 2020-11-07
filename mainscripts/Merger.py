@@ -1,4 +1,4 @@
-﻿import math
+import math
 import multiprocessing
 import traceback
 from pathlib import Path
@@ -26,6 +26,8 @@ def main (model_class_name=None,
           output_mask_path=None,
           aligned_path=None,
           force_gpu_idxs=None,
+          start_image=None,   #by saifuhameed for selective merging
+          end_image=None,     #by saifuhameed for selective merging
           cpu_only=None):
     io.log_info ("Running merger.\r\n")
 
@@ -33,10 +35,16 @@ def main (model_class_name=None,
         if not input_path.exists():
             io.log_err('Input directory not found. Please ensure it exists.')
             return
+        #by saifuhameed for selective merging  
+        if start_image==None:
+            start_image = io.input_str ("Start image file number to process from. eg 200 if to start from 00200.png", None)
+        if end_image==None:
+            end_image = io.input_str ("End image file number 'to process till'. eg 220 if to process till 00220.png", None)  
+        #by saifuhameed for selective merging
 
         if not output_path.exists():
             output_path.mkdir(parents=True, exist_ok=True)
-
+          
         if not output_mask_path.exists():
             output_mask_path.mkdir(parents=True, exist_ok=True)
 
@@ -77,7 +85,22 @@ def main (model_class_name=None,
                                         valid_range=[1, multiprocessing.cpu_count()], help_message="Specify the number of threads to process. A low value may affect performance. A high value may result in memory error. The value may not be greater than CPU cores." )
 
         input_path_image_paths = pathex.get_image_paths(input_path)
-
+        ##############by saifuhameed START########### 
+        FilterImages= True if (start_image!="" and end_image!="") and not (start_image is None or end_image is None) else False
+        if FilterImages :
+            def is_required_file(f):
+                img_filename = Path(f)
+                img_name = img_filename.stem
+                if int(img_name)>=int(start_image) and int(img_name)<=int(end_image):                
+                    return False 
+                else:
+                    return True        
+                
+            input_path_image_paths = [x for x in input_path_image_paths if not is_required_file(x)]                  
+        #############by saifuhameed END############    
+        
+        
+        
         if cfg.type == MergerConfig.TYPE_MASKED:
             if not aligned_path.exists():
                 io.log_err('Aligned directory not found. Please ensure it exists.')
@@ -95,11 +118,31 @@ def main (model_class_name=None,
                 def generator():
                     for sample in io.progress_bar_generator( packed_samples, "Collecting alignments"):
                         filepath = Path(sample.filename)
+                        ##############by saifuhameed START########### 
+                        if FilterImages:
+                            img_name = filepath.stem                        
+                            if img_name.find("_")>=0:
+                                img_name=img_name[:-2] 
+                            if int(img_name)>=int(start_image) and int(img_name)<=int(end_image):                
+                                pass
+                            else:
+                                continue
+                        ##############by saifuhameed END###########                        
                         yield filepath, DFLIMG.load(filepath, loader_func=lambda x: sample.read_raw_file()  )
             else:
                 def generator():
                     for filepath in io.progress_bar_generator( pathex.get_image_paths(aligned_path), "Collecting alignments"):
                         filepath = Path(filepath)
+                        ############by saifuhameed START############# 
+                        if FilterImages:
+                            img_name = filepath.stem                        
+                            if img_name.find("_")>=0:
+                                img_name=img_name[:-2] 
+                            if int(img_name)>=int(start_image) and int(img_name)<=int(end_image):                
+                                pass
+                            else:
+                                continue       
+                        #############by saifuhameed END############                  
                         yield filepath, DFLIMG.load(filepath)
 
             alignments = {}
@@ -206,6 +249,8 @@ def main (model_class_name=None,
                             output_mask_path       = output_mask_path,
                             model_iter             = model.get_iter(),
                             subprocess_count       = subprocess_count,
+                            start_image            = start_image, #SAIF_START start_image,end_image SAIF_END
+                            end_image              = end_image    #SAIF_START start_image,end_image SAIF_END
                         ).run()
 
         model.finalize()
