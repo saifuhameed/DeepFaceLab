@@ -139,8 +139,8 @@ class InteractiveMergerSubprocessor(Subprocessor):
 
 
 
-    #override
-    def __init__(self, is_interactive, merger_session_filepath, predictor_func, predictor_input_shape, face_enhancer_func, xseg_256_extract_func, merger_config, frames, frames_root_path, output_path, output_mask_path, model_iter, subprocess_count=4):
+    #override  SAIF_START start_image=None,end_image=None SAIF_END
+    def __init__(self, is_interactive, merger_session_filepath, predictor_func, predictor_input_shape, face_enhancer_func, xseg_256_extract_func, merger_config, frames, frames_root_path, output_path, output_mask_path, model_iter, subprocess_count=4,start_image=None,end_image=None):
         if len (frames) == 0:
             raise ValueError ("len (frames) == 0")
 
@@ -232,12 +232,30 @@ class InteractiveMergerSubprocessor(Subprocessor):
                 session_data = None
 
         if session_data is None:
+            FilterImages= True if (start_image!="" and end_image!="") and not (start_image is None or end_image is None) else False
             for filename in pathex.get_image_paths(self.output_path): #remove all images in output_path
+                ##############SAIF_START###########
+                if FilterImages:
+                    img_filename = Path(filename)
+                    img_name = img_filename.stem
+                    if int(img_name)>=int(start_image) and int(img_name)<=int(end_image):                
+                        pass
+                    else:
+                        continue   
+                ##############SAIF_END###########                         
                 Path(filename).unlink()
 
             for filename in pathex.get_image_paths(self.output_mask_path): #remove all images in output_mask_path
+                ##############SAIF_START###########
+                if FilterImages:
+                    img_filename = Path(filename)
+                    img_name = img_filename.stem
+                    if int(img_name)>=int(start_image) and int(img_name)<=int(end_image):                
+                        pass
+                    else:
+                        continue 
+                ##############SAIF_END###########
                 Path(filename).unlink()
-
 
             frames[0].cfg = self.merger_config.copy()
 
