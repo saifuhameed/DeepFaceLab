@@ -1,4 +1,4 @@
-﻿import traceback
+import traceback
 import math
 import multiprocessing
 import operator
@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-
+from PIL import Image, ImageDraw, ImageFont
 import cv2
 import numpy as np
 from numpy import linalg as npla
@@ -22,6 +22,7 @@ from core.leras import nn
 from core import pathex
 from core.cv2ex import *
 from DFLIMG import *
+import copy
 
 DEBUG = False
 
@@ -368,15 +369,31 @@ class ExtractSubprocessor(Subprocessor):
             self.force_landmarks = False
 
             self.landmarks = None
+            self.landmarksCopy = None
             self.x = 0
             self.y = 0
+            self.mx = 0
+            self.my = 0
+            self.select_init_x=0
+            self.select_init_y=0
             self.rect_size = 100
             self.rect_locked = False
             self.extract_needed = True
-
             self.image = None
             self.image_filepath = None
-
+            self.manual_point_edit_mode=False
+            self.start_select_mode=False
+            self.selected_points=[False] * 68
+            self.copied_points=[False] * 68
+            self.last_key = None
+            self.last_chr_key = None
+            self.last_alt_pressed = None
+            self.last_shift_pressed = None
+            self.last_ctrl_pressed = None
+            self.drag_point_index=-1
+            self.start_drag_mode=False
+            self.all_points_select=False
+            self.nearest_rect_prop=-1 # to aid RECT selection in manual mode
         io.progress_bar (None, len (self.input_data))
 
     #override
@@ -405,9 +422,70 @@ class ExtractSubprocessor(Subprocessor):
             client_dict['device_type'] = device_type
             yield client_dict['device_name'], {}, client_dict
 
+    def get_printable_landmark_data(self,lndmarks):        
+        view_landmarks  = self.landmarks   
+        #int_lmrks = np.array(view_landmarks, dtype=np.int) 
+        return "landmark" 
+    def dist(self,p1,p2):
+        x1,y1=p1
+        x2,y2=p2
+        d=math.sqrt(math.pow(x2-x1,2) + math.pow(y2-y1,2))
+        return d
+        
+    def check_rect_hittest(self,p): 
+        view_rect = (np.array(self.rect) * self.view_scale).astype(np.int).tolist()        
+        lowest_dist=9999999
+        nearest_index=-1
+        x,y=p
+        pdist=self.dist((x,y),(view_rect[0] , view_rect[1])) # hit test on top left corner
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=0
+        pdist=self.dist((x,y),(view_rect[2] , view_rect[1])) # hit test on top right corner
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=1
+        pdist=self.dist((x,y),(view_rect[2] , view_rect[3])) # hit test on bottom right corner
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=2
+        pdist=self.dist((x,y),(view_rect[0] , view_rect[3])) # hit test on bottom left corner
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=3
+        
+        pdist=self.dist((x,y),(x , view_rect[1])) # hit test on top side
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=4
+        pdist=self.dist((x,y),(view_rect[2] ,y)) # hit test on right side
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=5
+        pdist=self.dist((x,y),(x , view_rect[3])) # hit test on bottom side
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=6
+        pdist=self.dist((x,y),(view_rect[0] ,y)) # hit test on left side
+        if pdist<lowest_dist: lowest_dist=pdist; nearest_rect_prop=7                
+        if lowest_dist<5 :
+            return nearest_rect_prop
+        else:
+            return -1             
+    def check_point_hittest(self,p): 
+        view_landmarks  = (np.array(self.landmarks) * self.view_scale).astype(np.int).tolist()
+        lowest_dist=9999999
+        nearest_index=-1        
+        for i in range(68):           
+            x,y=view_landmarks[i]
+            pdist=self.dist((x,y),(p[0] , p[1]))
+            if pdist<lowest_dist: lowest_dist=pdist; nearest_index=i
+        if lowest_dist<5 :
+            return nearest_index
+        else:
+            return -1
+                
+    def check_points_within_rect(self,p1,p2, deselect): 
+        view_landmarks  = (np.array(self.landmarks) * self.view_scale).astype(np.int).tolist()
+        for i in range(68):
+            #if not deselect: self.selected_points[i]= False
+            x,y=view_landmarks[i]
+            if ((x>= min(p1[0] , p2[0])) and (x <= max(p1[0] , p2[0])) and (y >=min(p1[1] , p2[1])) and (y<=max(p1[1] , p2[1]))):
+                if deselect :
+                    self.selected_points[i]= False
+                else:
+                    self.selected_points[i] = True
+        return
+        
     #override
     def get_data(self, host_dict):
-        if self.type == 'landmarks-manual':
+        if self.type == 'landmarks-manual':            
             need_remark_face = False
             while len (self.input_data) > 0:
                 data = self.input_data[0]
@@ -434,17 +512,23 @@ class ExtractSubprocessor(Subprocessor):
 
                     (h,w,c) = self.image.shape
 
-                    sh = (0,0, w, min(100, h) )
+                    sh = (0,0, w, min(130, h) )
                     if self.cache_text_lines_img[0] == sh:
                         self.text_lines_img = self.cache_text_lines_img[1]
                     else:
-                        self.text_lines_img = (imagelib.get_draw_text_lines ( self.image, sh,
+                        self.text_lines_img = (imagelib.get_draw_text_lines (  self.image, sh,
                                                         [   '[L Mouse click] - lock/unlock selection. [Mouse wheel] - change rect',
                                                             '[R Mouse Click] - manual face rectangle',
                                                             '[Enter] / [Space] - confirm / skip frame',
                                                             '[,] [.]- prev frame, next frame. [Q] - skip remaining frames',
                                                             '[a] - accuracy on/off (more fps)',
-                                                            '[h] - hide this help'
+                                                            '[m] - manual point edit mode',
+                                                            '[s] - select/deselect all points',
+                                                            'Use L button to select and move, R button to deselect, Middle button to deselect all',
+                                                            '[c] - To copy currently selected points',
+                                                            '[v] - To paste  copied points',
+                                                            '[g] - To show/hide the points and rectangles',
+                                                            '[h] - hide this help', 'Image: ' + os.path.basename(self.image_filepath)                                                            
                                                         ], (1, 1, 1) )*255).astype(np.uint8)
 
                         self.cache_text_lines_img = (sh, self.text_lines_img)
@@ -473,48 +557,128 @@ class ExtractSubprocessor(Subprocessor):
                             new_y = self.y
 
                         new_rect_size = self.rect_size
-
+                        
                         mouse_events = io.get_mouse_events(self.wnd_name)
+
+                        if self.manual_point_edit_mode:
+                            keychanged=False
+                            if key!=self.last_key and key!=0: self.last_key=key; keychanged=True
+                            if chr_key!=self.last_chr_key and key!='': self.last_chr_key=chr_key; keychanged=True
+                            if alt_pressed!=self.last_alt_pressed: self.last_alt_pressed=alt_pressed; keychanged=True
+                            if shift_pressed!=self.last_shift_pressed: self.last_shift_pressed=shift_pressed; keychanged=True
+                            if ctrl_pressed!=self.last_ctrl_pressed: 
+                                self.last_ctrl_pressed=ctrl_pressed; 
+                                keychanged=True
+                            if keychanged: self.redraw()                        
                         for ev in mouse_events:
-                            (x, y, ev, flags) = ev
+                            (x, y, ev, flags) = ev 
+                            xyChanged=False 
+                            dx=0
+                            dy=0
+                            if self.mx!= x : 
+                                dx= x-self.mx
+                                self.mx=x  
+                                xyChanged=True                               
+                            if self.my!=y :
+                                dy= y-self.my  
+                                self.my =y  
+                                xyChanged=True
+                            if xyChanged==True: 
+                                if self.start_drag_mode:
+                                    should_redraw=False
+                                    for i in range(68):
+                                        if self.selected_points[i]==True:
+                                            self.landmarks[i][0]=self.landmarks[i][0]+dx/ self.view_scale
+                                            self.landmarks[i][1]=self.landmarks[i][1]+dy/ self.view_scale
+                                            should_redraw=True
+                                    if should_redraw: self.redraw()
+                                self.redraw()                                               
                             if ev == io.EVENT_MOUSEWHEEL and not self.rect_locked:
                                 mod = 1 if flags > 0 else -1
                                 diff = 1 if new_rect_size <= 40 else np.clip(new_rect_size / 10, 1, 10)
-                                new_rect_size = max (5, new_rect_size + diff*mod)
+                                new_rect_size = max (5, new_rect_size + diff*mod) 
+                            elif ev == io.EVENT_MBUTTONDOWN:
+                                if  self.manual_point_edit_mode: 
+                                    for i in range(68):
+                                        self.selected_points[i]=False 
+                                    self.redraw()                                          
+                            elif ev == io.EVENT_LBUTTONUP:
+                                if  self.manual_point_edit_mode:
+                                    if self.start_select_mode:
+                                        self.check_points_within_rect((self.select_init_x,self.select_init_y),(x,y),deselect=False)
+                                        self.start_select_mode = False 
+                                    if self.start_drag_mode:                                        
+                                        self.start_drag_mode = False
+                                    
+                                    self.redraw()                                     
                             elif ev == io.EVENT_LBUTTONDOWN:
-                                if self.force_landmarks:
-                                    self.x = new_x
-                                    self.y = new_y
-                                    self.force_landmarks = False
-                                    self.rect_locked = True
-                                    self.redraw()
-                                else:
-                                    self.rect_locked = not self.rect_locked
-                                    self.extract_needed = True
+                                if not self.manual_point_edit_mode:
+                                    if self.force_landmarks:
+                                        self.x = new_x
+                                        self.y = new_y
+                                        self.force_landmarks = False
+                                        self.rect_locked = True
+                                        self.redraw()
+                                    else:
+                                        self.rect_locked = not self.rect_locked
+                                        self.extract_needed = True 
+                                else: 
+                                    ret=self.check_point_hittest((x,y))
+                                    ret2=self.check_rect_hittest((x,y))
+                                    
+                                    if ret != -1: #if directly clicked on a point, then start drag  
+                                        if self.selected_points[ret]!=True:
+                                            for i in range(68):
+                                                self.selected_points[i] = False
+                                            self.selected_points[ret] = True
+                                        self.start_drag_mode = True
+                                        self.drag_point_index=ret
+                                    else:                                        
+                                        self.start_select_mode = True
+                                        self.select_init_x=x
+                                        self.select_init_y=y 
+                            elif ev == io.EVENT_RBUTTONUP:
+                                if self.manual_point_edit_mode:
+                                    self.start_select_mode = False
+                                    self.check_points_within_rect((self.select_init_x,self.select_init_y),(x,y),deselect=True)                                     
+                                    self.redraw()      
                             elif ev == io.EVENT_RBUTTONDOWN:
-                                self.force_landmarks = not self.force_landmarks
-                                if self.force_landmarks:
-                                    self.rect_locked = False
+                                if not self.manual_point_edit_mode:
+                                    self.force_landmarks = not self.force_landmarks
+                                    if self.force_landmarks:
+                                        self.rect_locked = False
+                                else:
+                                    self.start_select_mode = True
+                                    self.select_init_x=x
+                                    self.select_init_y=y 
                             elif not self.rect_locked:
                                 new_x = np.clip (x, 0, w-1) / self.view_scale
                                 new_y = np.clip (y, 0, h-1) / self.view_scale
-
+                       
                         key_events = io.get_key_events(self.wnd_name)
-                        key, chr_key, ctrl_pressed, alt_pressed, shift_pressed = key_events[-1] if len(key_events) > 0 else (0,0,False,False,False)
+                        key, chr_key, ctrl_pressed, alt_pressed, shift_pressed = key_events[-1] if len(key_events) > 0 else (0,0,False,False,False) 
 
                         if key == ord('\r') or key == ord('\n'):
                             #confirm frame
+                            self.manual_point_edit_mode=False
+                            for i in range(68):
+                                self.selected_points[i]=False
                             is_frame_done = True
                             data_rects.append (self.rect)
                             data_landmarks.append (self.landmarks)
                             break
                         elif key == ord(' '):
                             #confirm skip frame
+                            self.manual_point_edit_mode=False
+                            for i in range(68):
+                                self.selected_points[i]=False
                             is_frame_done = True
                             break
                         elif key == ord(',')  and len(self.result) > 0:
                             #go prev frame
-
+                            self.manual_point_edit_mode=False
+                            for i in range(68):
+                                self.selected_points[i]=False
                             if self.rect_locked:
                                 self.rect_locked = False
                                 # Only save the face if the rect is still locked
@@ -528,8 +692,10 @@ class ExtractSubprocessor(Subprocessor):
 
                             break
                         elif key == ord('.'):
+                            self.manual_point_edit_mode=False
+                            for i in range(68):
+                                    self.selected_points[i]=False
                             #go next frame
-
                             if self.rect_locked:
                                 self.rect_locked = False
                                 # Only save the face if the rect is still locked
@@ -540,8 +706,8 @@ class ExtractSubprocessor(Subprocessor):
                             is_frame_done = True
                             break
                         elif key == ord('q'):
+                            self.manual_point_edit_mode=False
                             #skip remaining
-
                             if self.rect_locked:
                                 self.rect_locked = False
                                 data_rects.append (self.rect)
@@ -558,8 +724,89 @@ class ExtractSubprocessor(Subprocessor):
                             break
                         elif key == ord('a'):
                             self.landmarks_accurate = not self.landmarks_accurate
+                            break                        
+                        elif key == ord('m'):                            
+                            self.manual_point_edit_mode = not self.manual_point_edit_mode 
+                            if self.manual_point_edit_mode:
+                                self.landmarksCopy=copy.deepcopy( self.landmarks ) 
+                                self.x = new_x
+                                self.y = new_y
+                                self.force_landmarks = False
+                                self.rect_locked = True   
+                                for i in range(68):
+                                    self.selected_points[i]= False
+                            #else:
+                                #self.rect_locked = False
+                                #self.extract_needed = True                      
+                            self.redraw()
                             break
-
+                        elif key == ord('s'):
+                            #Select All OR select none
+                            self.all_points_select=not self.all_points_select
+                            for i in range(68):
+                                self.selected_points[i]= self.all_points_select
+                            self.redraw()
+                            break
+                        elif key == ord('u'):
+                            #Move selected points up
+                            should_redraw=False
+                            for i in range(68):
+                                if self.selected_points[i]==True:
+                                    self.landmarks[i][1]=self.landmarks[i][1]-5
+                                    should_redraw=True
+                                if should_redraw: self.redraw()
+                            break
+                        elif key == ord('d'):
+                            #Move selected points down
+                            should_redraw=False
+                            for i in range(68):
+                                if self.selected_points[i]==True:
+                                    self.landmarks[i][1]=self.landmarks[i][1]+5
+                                    should_redraw=True
+                                if should_redraw: self.redraw()
+                            break 
+                        elif key == ord('l'):
+                            #Move selected points left
+                            should_redraw=False
+                            for i in range(68):
+                                if self.selected_points[i]==True:
+                                    self.landmarks[i][0]=self.landmarks[i][0]-5
+                                    should_redraw=True
+                                if should_redraw: self.redraw()
+                            break   
+                        elif key == ord('r'):
+                            #Move selected points left
+                            should_redraw=False
+                            for i in range(68):
+                                if self.selected_points[i]==True:
+                                    self.landmarks[i][0]=self.landmarks[i][0]+5
+                                    should_redraw=True
+                                if should_redraw: self.redraw()
+                            break   
+                        elif key == ord('c'):
+                            #Copy All land marks and keep for later use
+                            if self.manual_point_edit_mode:
+                                for i in range(68):
+                                    self.copied_points[i]=False
+                                    if self.selected_points[i]==True:
+                                        self.copied_points[i]=True                                
+                                self.landmarksCopy2=copy.deepcopy( self.landmarks )                            
+                            break  
+                        elif key == ord('v'):
+                            #paste land marks from copy
+                            if self.manual_point_edit_mode:
+                                for i in range(68):
+                                    if self.copied_points[i]==True:
+                                        self.landmarks[i][0]=self.landmarksCopy2[i][0]
+                                        self.landmarks[i][1]=self.landmarksCopy2[i][1]                                
+                            self.redraw()                           
+                            break  
+                        elif key == ord('o'):
+                            #reload original land marks
+                            if self.manual_point_edit_mode:
+                                self.landmarks=copy.deepcopy(self.landmarksCopy)
+                                self.redraw()                           
+                            break                                                                                                                                                                            
                         if self.force_landmarks:
                             pt2 = np.float32([new_x, new_y])
                             pt1 = np.float32([self.x, self.y])
@@ -598,7 +845,7 @@ class ExtractSubprocessor(Subprocessor):
                                           int(self.y+self.rect_size) )
 
                             return ExtractSubprocessor.Data (filepath, rects=[self.rect], landmarks_accurate=self.landmarks_accurate)
-
+                
                 else:
                     is_frame_done = True
 
@@ -620,15 +867,18 @@ class ExtractSubprocessor(Subprocessor):
             self.input_data.insert(0, data)
 
     def redraw(self):
+        
+        view_rect = (np.array(self.rect) * self.view_scale).astype(np.int).tolist()
+        view_landmarks  = (np.array(self.landmarks) * self.view_scale).astype(np.int).tolist()
         (h,w,c) = self.image.shape
+        sh = (100,500, w,520 )
 
+              
         if not self.hide_help:
             image = cv2.addWeighted (self.image,1.0,self.text_lines_img,1.0,0)
         else:
             image = self.image.copy()
 
-        view_rect = (np.array(self.rect) * self.view_scale).astype(np.int).tolist()
-        view_landmarks  = (np.array(self.landmarks) * self.view_scale).astype(np.int).tolist()
 
         if self.rect_size <= 40:
             scaled_rect_size = h // 3 if w > h else w // 3
@@ -646,13 +896,35 @@ class ExtractSubprocessor(Subprocessor):
             image = cv2.warpAffine(image, mat,(w,h) )
             view_landmarks = LandmarksProcessor.transform_points (view_landmarks, mat)
 
-        landmarks_color = (255,255,0) if self.rect_locked else (0,255,0)
+
+        
+        landmarks_color =  (255,255,0)   if  (not self.rect_locked) else  ((0,255,255) if (self.rect_locked and self.manual_point_edit_mode) else (0,255,0) )
+        #landmarks_color =   (0,255,255) if (self.rect_locked and self.manual_point_edit_mode) else  (255,255,0)
         LandmarksProcessor.draw_rect_landmarks (image, view_rect, view_landmarks, self.face_type, self.image_size, landmarks_color=landmarks_color)
         self.extract_needed = False
 
+        
+        if self.manual_point_edit_mode : 
+            color = (255, 255, 128)            
+            #org = (10, 150)
+            #fontScale = 0.4             
+            #thickness = 1  
+            #font = cv2.FONT_HERSHEY_SIMPLEX        
+            #image = cv2.putText(image, "x= " + str(round(self.mx,1)) + ", y= " + str(round(self.my,1)), org, font, fontScale, color, thickness, cv2.LINE_AA) 
+            #image = cv2.putText(image, "Key:" + str(self.last_key) + ", chr_key: " + str(self.last_chr_key) + ", alt_pressed: " + \
+            #                     str(self.last_alt_pressed) + ", shift_pressed: " + str(self.last_shift_pressed) + ", ctrl_pressed: " + str(self.last_ctrl_pressed), (10,200), font, fontScale, color, thickness, cv2.LINE_AA)  
+            for i in range(68):
+                if self.selected_points[i]==True:
+                    cv2.circle(image,  (view_landmarks[i][0],view_landmarks[i] [1]),3,(64,64,255),1) 
+                         
+            if self.start_select_mode:
+                cv2.rectangle(image,(self.select_init_x,self.select_init_y),(self.mx,self.my),color)
+            
+            #image_to_face_mat = LandmarksProcessor.get_transform_mat (view_landmarks, self.image_size, self.face_type)
+            #points = LandmarksProcessor.transform_points ( [ (0,0), (0,self.image_size-1), (self.image_size-1, self.image_size-1), (self.image_size-1,0) ], image_to_face_mat, True)
+            #imagelib.draw_polygon (image, points, (0,0,255), 2)
+            
         io.show_image (self.wnd_name, image)
-
-
     #override
     def on_result (self, host_dict, data, result):
         if self.type == 'landmarks-manual':
