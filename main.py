@@ -160,6 +160,8 @@ if __name__ == "__main__":
                       output_mask_path       = Path(arguments.output_mask_dir),
                       aligned_path           = Path(arguments.aligned_dir) if arguments.aligned_dir is not None else None,
                       force_gpu_idxs         = arguments.force_gpu_idxs,
+                      start_image            = arguments.start_image,       #by saifuhameed for selective image merging
+                      end_image              = arguments.end_image,         #by saifuhameed for selective image merging
                       cpu_only               = arguments.cpu_only)
 
     p = subparsers.add_parser( "merge", help="Merger")
@@ -172,6 +174,8 @@ if __name__ == "__main__":
     p.add_argument('--force-model-name', dest="force_model_name", default=None, help="Forcing to choose model name from model/ folder.")
     p.add_argument('--cpu-only', action="store_true", dest="cpu_only", default=False, help="Merge on CPU.")
     p.add_argument('--force-gpu-idxs', dest="force_gpu_idxs", default=None, help="Force to choose GPU indexes separated by comma.")
+    p.add_argument('--start-image', dest="start_image", default=None, help="Start merge from specified image") #by saifuhameed for selective image merging
+    p.add_argument('--end-image', dest="end_image", default=None, help="End merge till specified image")       #by saifuhameed for selective image merging
     p.set_defaults(func=process_merge)
 
     videoed_parser = subparsers.add_parser( "videoed", help="Video processing.").add_subparsers()
